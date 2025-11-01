@@ -1,88 +1,129 @@
 import os
-import torch
+import warnings
+import time
+from pathlib import Path
+import argparse
 import numpy as np
 import pandas as pd
-import redis
+import torch
 from omegaconf import OmegaConf
-import time
 from tqdm import tqdm
 import editdistance
-import argparse
 
 from rnn_model import GRUDecoder
 from evaluate_model_helpers import *
+from pyctcdecode import build_ctcdecoder
 
-# argument parser for command line arguments
+warnings.filterwarnings("ignore", category=FutureWarning)
+
+# ---------------------------
+# Command line arguments
+# ---------------------------
 parser = argparse.ArgumentParser(
-    description="Evaluate a pretrained RNN model on the copy task dataset."
+    description="Evaluate RNN model with (optional) KenLM decoding via pyctcdecode."
 )
 parser.add_argument(
-    "--model_path",
+    "--model_path", type=str, default="../data/t15_pretrained_rnn_baseline"
+)
+parser.add_argument("--data_dir", type=str, default="../data/hdf5_data_final")
+parser.add_argument("--eval_type", type=str, default="test", choices=["val", "test"])
+parser.add_argument(
+    "--csv_path", type=str, default="../data/t15_copyTaskData_description.csv"
+)
+parser.add_argument(
+    "--kenlm_path",
     type=str,
-    default="../data/t15_pretrained_rnn_baseline",
-    help="Path to the pretrained model directory (relative to the current working directory).",
+    default="../data/5gram.arpa",
+    help="Path to .arpa (or a folder containing .arpa). If missing, use decoder without LM.",
+)
+parser.add_argument("--gpu_number", type=int, default=-1)
+# decoding hyper-params
+parser.add_argument(
+    "--alpha", type=float, default=0.7, help="LM weight (higher → stronger LM)."
 )
 parser.add_argument(
-    "--data_dir",
-    type=str,
-    default="../data/hdf5_data_final",
-    help="Path to the dataset directory (relative to the current working directory).",
+    "--beta",
+    type=float,
+    default=0.5,
+    help="Token insertion bonus (higher → longer outputs).",
 )
 parser.add_argument(
-    "--eval_type",
-    type=str,
-    default="test",
-    choices=["val", "test"],
-    help='Evaluation type: "val" for validation set, "test" for test set. '
-    'If "test", ground truth is not available.',
+    "--beam_width", type=int, default=20, help="Beam width used in decoding."
 )
+# CTC settings
 parser.add_argument(
-    "--csv_path",
-    type=str,
-    default="../data/t15_copyTaskData_description.csv",
-    help="Path to the CSV file with metadata about the dataset (relative to the current working directory).",
-)
-parser.add_argument(
-    "--gpu_number",
+    "--blank_idx",
     type=int,
-    default=-1,
-    help="GPU number to use for RNN model inference. Set to -1 to use CPU.",
+    default=0,
+    help="Index of the CTC blank token in class logits.",
 )
 args = parser.parse_args()
 
-# paths to model and data directories
-# Note: these paths are relative to the current working directory
-model_path = args.model_path
-data_dir = args.data_dir
 
-# define evaluation type
-eval_type = (
-    args.eval_type
-)  # can be 'val' or 'test'. if 'test', ground truth is not available
+# ---------------------------
+# Utilities
+# ---------------------------
+def numpy_log_softmax(x: np.ndarray, axis: int = -1) -> np.ndarray:
+    """Numerically stable log-softmax in numpy."""
+    x_max = np.max(x, axis=axis, keepdims=True)
+    y = x - x_max
+    logsum = np.log(np.exp(y).sum(axis=axis, keepdims=True) + 1e-9)
+    return y - logsum
 
-# load csv file
+
+def resolve_arpa_path(kenlm_path: str | None) -> str | None:
+    """Return a usable .arpa path or None (fallback to no-LM). Accepts file or directory."""
+    if not kenlm_path:
+        return None
+    p = Path(kenlm_path).expanduser()
+    if p.exists():
+        if p.is_file():
+            return str(p.resolve())
+        if p.is_dir():
+            cand = list(p.glob("*.arpa")) + list(p.glob("*.arpa.gz"))
+            if not cand:
+                return None
+            cand.sort(key=lambda q: (q.stat().st_mtime, q.stat().st_size), reverse=True)
+            return str(cand[0].resolve())
+    p2 = (Path.cwd() / kenlm_path).resolve()
+    if p2.exists():
+        if p2.is_file():
+            return str(p2)
+        if p2.is_dir():
+            cand = list(p2.glob("*.arpa")) + list(p2.glob("*.arpa.gz"))
+            if not cand:
+                return None
+            cand.sort(key=lambda q: (q.stat().st_mtime, q.stat().st_size), reverse=True)
+            return str(cand[0])
+    return None
+
+
+# ---------------------------
+# Load model configuration
+# ---------------------------
 b2txt_csv_df = pd.read_csv(args.csv_path)
+model_args = OmegaConf.load(os.path.join(args.model_path, "checkpoint/args.yaml"))
 
-# load model args
-model_args = OmegaConf.load(os.path.join(model_path, "checkpoint/args.yaml"))
-
-# set up gpu device
-gpu_number = args.gpu_number
-if torch.cuda.is_available() and gpu_number >= 0:
-    if gpu_number >= torch.cuda.device_count():
-        raise ValueError(
-            f"GPU number {gpu_number} is out of range. Available GPUs: {torch.cuda.device_count()}"
-        )
-    device = f"cuda:{gpu_number}"
-    device = torch.device(device)
-    print(f"Using {device} for model inference.")
+# ---------------------------
+# Device setup
+# ---------------------------
+if (
+    torch.cuda.is_available()
+    and args.gpu_number >= 0
+    and args.gpu_number < torch.cuda.device_count()
+):
+    device = torch.device(f"cuda:{args.gpu_number}")
+    print(f"[INFO] Using {device}")
 else:
-    if gpu_number >= 0:
-        print(f"GPU number {gpu_number} requested but not available.")
-    print("Using CPU for model inference.")
     device = torch.device("cpu")
+    if args.gpu_number >= 0 and torch.cuda.is_available():
+        print(f"[WARN] Requested cuda:{args.gpu_number} but not available. Using CPU.")
+    else:
+        print("[INFO] Using CPU")
 
-# define model
+# ---------------------------
+# Define & load model
+# ---------------------------
 model = GRUDecoder(
     neural_dim=model_args["model"]["n_input_features"],
     n_units=model_args["model"]["n_units"],
@@ -95,13 +136,14 @@ model = GRUDecoder(
     patch_stride=model_args["model"]["patch_stride"],
 )
 
-# load model weights
+# PyTorch 2.6+: weights_only default is True; use trusted full load
 checkpoint = torch.load(
-    os.path.join(model_path, "checkpoint/best_checkpoint"),
-    weights_only=False,
+    os.path.join(args.model_path, "checkpoint/best_checkpoint"),
     map_location=device,
+    weights_only=False,
 )
-# rename keys to not start with "module." (happens if model was saved with DataParallel)
+
+# Remove DataParallel / torch.compile prefixes if present
 for key in list(checkpoint["model_state_dict"].keys()):
     checkpoint["model_state_dict"][key.replace("module.", "")] = checkpoint[
         "model_state_dict"
@@ -109,119 +151,107 @@ for key in list(checkpoint["model_state_dict"].keys()):
     checkpoint["model_state_dict"][key.replace("_orig_mod.", "")] = checkpoint[
         "model_state_dict"
     ].pop(key)
+
 model.load_state_dict(checkpoint["model_state_dict"])
-
-# add model to device
 model.to(device)
-
-# set model to eval mode
 model.eval()
 
-# load data for each session
-test_data = {}
-total_test_trials = 0
+# ---------------------------
+# Load dataset (read once)
+# ---------------------------
+test_data: dict[str, dict] = {}
+total_trials = 0
 for session in model_args["dataset"]["sessions"]:
-    files = [
-        f for f in os.listdir(os.path.join(data_dir, session)) if f.endswith(".hdf5")
-    ]
-    if f"data_{eval_type}.hdf5" in files:
-        eval_file = os.path.join(data_dir, session, f"data_{eval_type}.hdf5")
-
+    session_dir = os.path.join(args.data_dir, session)
+    files = [f for f in os.listdir(session_dir) if f.endswith(".hdf5")]
+    if f"data_{args.eval_type}.hdf5" in files:
+        eval_file = os.path.join(session_dir, f"data_{args.eval_type}.hdf5")
         data = load_h5py_file(eval_file, b2txt_csv_df)
         test_data[session] = data
-
-        total_test_trials += len(test_data[session]["neural_features"])
+        total_trials += len(data["neural_features"])
         print(
-            f'Loaded {len(test_data[session]["neural_features"])} {eval_type} trials for session {session}.'
+            f"Loaded {len(data['neural_features'])} {args.eval_type} trials for session {session}."
         )
-print(f"Total number of {eval_type} trials: {total_test_trials}")
-print()
+print(f"Total number of {args.eval_type} trials: {total_trials}\n")
 
+if total_trials == 0:
+    raise RuntimeError(
+        "No trials found. Check --data_dir, --eval_type and sessions list in args.yaml."
+    )
 
-# put neural data through the pretrained model to get phoneme predictions (logits)
-with tqdm(
-    total=total_test_trials, desc="Predicting phoneme sequences", unit="trial"
-) as pbar:
-    for session, data in test_data.items():
+# ---------------------------
+# Forward pass: get logits (numpy float32, no grad)  — store once
+# ---------------------------
+with torch.no_grad():
+    with tqdm(total=total_trials, desc="Predicting logits", unit="trial") as pbar:
+        for session, data in test_data.items():
+            data["logits_np"] = []  # list of (T, C)
+            input_layer = model_args["dataset"]["sessions"].index(session)
+            for trial in range(len(data["neural_features"])):
+                arr = np.expand_dims(
+                    data["neural_features"][trial], axis=0
+                )  # (1, T, F)
+                neural_input = torch.as_tensor(arr, device=device, dtype=torch.float32)
+                logits = runSingleDecodingStep(
+                    neural_input, input_layer, model, model_args, device
+                )  # (1, T, C)
+                data["logits_np"].append(
+                    np.asarray(logits[0], dtype=np.float32)
+                )  # (T, C)
+                pbar.update(1)
 
-        data["logits"] = []
-        data["pred_seq"] = []
-        input_layer = model_args["dataset"]["sessions"].index(session)
+# ---------------------------
+# Build labels aligned to C; move blank to index 0 by reordering
+# ---------------------------
+first_session = next(iter(test_data.keys()))
+T0, C = test_data[first_session]["logits_np"][0].shape
 
-        for trial in range(len(data["neural_features"])):
-            # get neural input for the trial
-            neural_input = data["neural_features"][trial]
+labels_raw = [
+    LOGIT_TO_PHONEME[i] if i < len(LOGIT_TO_PHONEME) else f"PH_{i}" for i in range(C)
+]
 
-            # add batch dimension
-            neural_input = np.expand_dims(neural_input, axis=0)
+# 重排順序：把 blank_idx 移到第 0 位
+blank_idx = int(args.blank_idx)
+order = [blank_idx] + [i for i in range(C) if i != blank_idx]
 
-            # convert to torch tensor
-            neural_input = torch.tensor(
-                neural_input, device=device, dtype=torch.float32
-            )
+# 依照 order 產生 labels；index 0 設為空字串（pyctcdecode 的 blank）
+labels = []
+for j, i in enumerate(order):
+    if j == 0:
+        labels.append("")
+    else:
+        tok = str(labels_raw[i]).strip().replace(" ", "_")
+        labels.append(tok)
 
-            # run decoding step
-            logits = runSingleDecodingStep(
-                neural_input, input_layer, model, model_args, device
-            )
-            data["logits"].append(logits)
+if len(labels) != C:
+    raise RuntimeError(
+        f"[ERR] labels length {len(labels)} != C={C}. Check LOGIT_TO_PHONEME / n_classes."
+    )
 
-            pbar.update(1)
-pbar.close()
+# ---------------------------
+# Build decoder (KenLM if available, otherwise no-LM) — no ctc_token_idx
+# ---------------------------
+arpa_path = resolve_arpa_path(args.kenlm_path)
+if arpa_path is not None:
+    print(f"[INFO] Loading KenLM 5-gram model from: {arpa_path}")
+else:
+    print(
+        f"[WARN] No .arpa found (looked up from '{args.kenlm_path}'). Using decoder WITHOUT LM."
+    )
 
+try:
+    decoder = build_ctcdecoder(labels=labels, kenlm_model_path=arpa_path)
+    try:
+        decoder.set_lm_alpha_beta(alpha=args.alpha, beta=args.beta)
+    except Exception:
+        pass
+except Exception as e:
+    print("[WARN] build_ctcdecoder failed, fallback to NO LM:", repr(e))
+    decoder = build_ctcdecoder(labels=labels, kenlm_model_path=None)
 
-# convert logits to phoneme sequences and print them out
-for session, data in test_data.items():
-    data["pred_seq"] = []
-    for trial in range(len(data["logits"])):
-        logits = data["logits"][trial][0]
-        pred_seq = np.argmax(logits, axis=-1)
-        # remove blanks (0)
-        pred_seq = [int(p) for p in pred_seq if p != 0]
-        # remove consecutive duplicates
-        pred_seq = [
-            pred_seq[i]
-            for i in range(len(pred_seq))
-            if i == 0 or pred_seq[i] != pred_seq[i - 1]
-        ]
-        # convert to phonemes
-        pred_seq = [LOGIT_TO_PHONEME[p] for p in pred_seq]
-        # add to data
-        data["pred_seq"].append(pred_seq)
-
-        # print out the predicted sequences
-        block_num = data["block_num"][trial]
-        trial_num = data["trial_num"][trial]
-        print(f"Session: {session}, Block: {block_num}, Trial: {trial_num}")
-        if eval_type == "val":
-            sentence_label = data["sentence_label"][trial]
-            true_seq = data["seq_class_ids"][trial][0 : data["seq_len"][trial]]
-            true_seq = [LOGIT_TO_PHONEME[p] for p in true_seq]
-
-            print(f"Sentence label:      {sentence_label}")
-            print(f'True sequence:       {" ".join(true_seq)}')
-        print(f'Predicted Sequence:  {" ".join(pred_seq)}')
-        print()
-
-'''
-# language model inference via redis
-# make sure that the standalone language model is running on the localhost redis ip
-# see README.md for instructions on how to run the language model
-r = redis.Redis(host="localhost", port=6379, db=0)
-r.flushall()  # clear all streams in redis
-
-# define redis streams for the remote language model
-remote_lm_input_stream = "remote_lm_input"
-remote_lm_output_partial_stream = "remote_lm_output_partial"
-remote_lm_output_final_stream = "remote_lm_output_final"
-
-# set timestamps for last entries seen in the redis streams
-remote_lm_output_partial_lastEntrySeen = get_current_redis_time_ms(r)
-remote_lm_output_final_lastEntrySeen = get_current_redis_time_ms(r)
-remote_lm_done_resetting_lastEntrySeen = get_current_redis_time_ms(r)
-remote_lm_done_finalizing_lastEntrySeen = get_current_redis_time_ms(r)
-remote_lm_done_updating_lastEntrySeen = get_current_redis_time_ms(r)
-
+# ---------------------------
+# Decoding (use stored logits once; reorder class axis; log-softmax)
+# ---------------------------
 lm_results = {
     "session": [],
     "block": [],
@@ -230,211 +260,57 @@ lm_results = {
     "pred_sentence": [],
 }
 
-# loop through all trials and put logits into the remote language model to get text predictions
-# note: this takes ~15-20 minutes to run on the entire test split with the 5-gram LM + OPT rescoring (RTX 4090)
-with tqdm(
-    total=total_test_trials, desc="Running remote language model", unit="trial"
-) as pbar:
-    for session in test_data.keys():
-        for trial in range(len(test_data[session]["logits"])):
-            # get trial logits and rearrange them for the LM
-            logits = rearrange_speech_logits_pt(test_data[session]["logits"][trial])[0]
+with torch.no_grad():
+    with tqdm(total=total_trials, desc="Decoding", unit="trial") as pbar:
+        for session, data in test_data.items():
+            for trial in range(len(data["logits_np"])):
+                logits_np = data["logits_np"][trial]  # (T, C)
+                logits_np = logits_np[:, order]  # 類別重排：blank → index 0
+                logp = numpy_log_softmax(logits_np, axis=-1)
 
-            # reset language model
-            remote_lm_done_resetting_lastEntrySeen = reset_remote_language_model(
-                r, remote_lm_done_resetting_lastEntrySeen
-            )
+                try:
+                    pred_sentence = decoder.decode(logp, beam_width=args.beam_width)
+                except TypeError:
+                    pred_sentence = decoder.decode(logp)
 
-            """
-            # update language model parameters
-            remote_lm_done_updating_lastEntrySeen = update_remote_lm_params(
-                r,
-                remote_lm_done_updating_lastEntrySeen,
-                acoustic_scale=0.35,
-                blank_penalty=90.0,
-                alpha=0.55,
-            )
-            """
-
-            # put logits into LM
-            remote_lm_output_partial_lastEntrySeen, decoded = send_logits_to_remote_lm(
-                r,
-                remote_lm_input_stream,
-                remote_lm_output_partial_stream,
-                remote_lm_output_partial_lastEntrySeen,
-                logits,
-            )
-
-            # finalize remote LM
-            remote_lm_output_final_lastEntrySeen, lm_out = finalize_remote_lm(
-                r,
-                remote_lm_output_final_stream,
-                remote_lm_output_final_lastEntrySeen,
-            )
-
-            # get the best candidate sentence
-            best_candidate_sentence = lm_out["candidate_sentences"][0]
-
-            # store results
-            lm_results["session"].append(session)
-            lm_results["block"].append(test_data[session]["block_num"][trial])
-            lm_results["trial"].append(test_data[session]["trial_num"][trial])
-            if eval_type == "val":
+                lm_results["session"].append(session)
+                lm_results["block"].append(data["block_num"][trial])
+                lm_results["trial"].append(data["trial_num"][trial])
                 lm_results["true_sentence"].append(
-                    test_data[session]["sentence_label"][trial]
+                    data["sentence_label"][trial] if args.eval_type == "val" else None
                 )
-            else:
-                lm_results["true_sentence"].append(None)
-            lm_results["pred_sentence"].append(best_candidate_sentence)
+                lm_results["pred_sentence"].append(pred_sentence)
+                pbar.update(1)
 
-            # update progress bar
-            pbar.update(1)
-pbar.close()
-
-
-# if using the validation set, lets calculate the aggregate word error rate (WER)
-if eval_type == "val":
-    total_true_length = 0
-    total_edit_distance = 0
-
-    lm_results["edit_distance"] = []
-    lm_results["num_words"] = []
-
+# ---------------------------
+# Compute WER (if validation set)
+# ---------------------------
+if args.eval_type == "val":
+    total_words, total_edits = 0, 0
     for i in range(len(lm_results["pred_sentence"])):
         true_sentence = remove_punctuation(lm_results["true_sentence"][i]).strip()
         pred_sentence = remove_punctuation(lm_results["pred_sentence"][i]).strip()
         ed = editdistance.eval(true_sentence.split(), pred_sentence.split())
-
-        total_true_length += len(true_sentence.split())
-        total_edit_distance += ed
-
-        lm_results["edit_distance"].append(ed)
-        lm_results["num_words"].append(len(true_sentence.split()))
-
+        total_words += len(true_sentence.split())
+        total_edits += ed
         print(
-            f'{lm_results["session"][i]} - Block {lm_results["block"][i]}, Trial {lm_results["trial"][i]}'
+            f"Trial {i}: WER = {ed}/{len(true_sentence.split())} = {ed/len(true_sentence.split()):.2f}"
         )
-        print(f"True sentence:       {true_sentence}")
-        print(f"Predicted sentence:  {pred_sentence}")
-        print(
-            f"WER: {ed} / {100 * len(true_sentence.split())} = {ed / len(true_sentence.split()):.2f}%"
-        )
-        print()
-
-    print(f"Total true sentence length: {total_true_length}")
-    print(f"Total edit distance: {total_edit_distance}")
-    print(
-        f"Aggregate Word Error Rate (WER): {100 * total_edit_distance / total_true_length:.2f}%"
-    )
-
-
-# write predicted sentences to a csv file. put a timestamp in the filename (YYYYMMDD_HHMMSS)
-output_file = os.path.join(
-    model_path,
-    f'baseline_rnn_{eval_type}_predicted_sentences_{time.strftime("%Y%m%d_%H%M%S")}.csv',
-)
-ids = [i for i in range(len(lm_results["pred_sentence"]))]
-df_out = pd.DataFrame({"id": ids, "text": lm_results["pred_sentence"]})
-df_out.to_csv(output_file, index=False)
-'''
-# ---------------------------------------------------------------
-# CTC Greedy Decoding (取代 Redis 語言模型)
-# ---------------------------------------------------------------
-print("[INFO] Using simple CTC Greedy Decoding (no language model).")
-
-lm_results = {
-    "session": [],
-    "block": [],
-    "trial": [],
-    "true_sentence": [],
-    "pred_sentence": [],
-}
-
-
-def ctc_greedy_decode(logits):
-    """
-    logits: numpy array or torch.Tensor of shape (T, num_classes)
-    return: list of predicted token ids (int)
-    """
-    if isinstance(logits, torch.Tensor):
-        logits = logits.cpu().numpy()
-    pred_ids = np.argmax(logits, axis=-1)
-    result = []
-    prev = -1
-    for p in pred_ids:
-        if p != 0 and p != prev:  # 0 為 blank
-            result.append(int(p))
-        prev = p
-    return result
-
-
-# 對所有試次進行解碼
-with tqdm(total=total_test_trials, desc="CTC Greedy Decoding", unit="trial") as pbar:
-    for session, data in test_data.items():
-        for trial in range(len(data["logits"])):
-            logits = data["logits"][trial][0]
-
-            pred_ids = ctc_greedy_decode(logits)
-            pred_phonemes = [LOGIT_TO_PHONEME[i] for i in pred_ids]
-            sentence_str = " ".join(pred_phonemes)
-
-            lm_results["session"].append(session)
-            lm_results["block"].append(data["block_num"][trial])
-            lm_results["trial"].append(data["trial_num"][trial])
-            if eval_type == "val":
-                lm_results["true_sentence"].append(data["sentence_label"][trial])
-            else:
-                lm_results["true_sentence"].append(None)
-            lm_results["pred_sentence"].append(sentence_str)
-            pbar.update(1)
-pbar.close()
-
-# ---------------------------------------------------------------
-# (optional) 計算 Word Error Rate (WER)
-# ---------------------------------------------------------------
-if eval_type == "val":
-    total_true_length = 0
-    total_edit_distance = 0
-    lm_results["edit_distance"] = []
-    lm_results["num_words"] = []
-
-    for i in range(len(lm_results["pred_sentence"])):
-        true_sentence = remove_punctuation(lm_results["true_sentence"][i]).strip()
-        pred_sentence = remove_punctuation(lm_results["pred_sentence"][i]).strip()
-        ed = editdistance.eval(true_sentence.split(), pred_sentence.split())
-
-        total_true_length += len(true_sentence.split())
-        total_edit_distance += ed
-
-        lm_results["edit_distance"].append(ed)
-        lm_results["num_words"].append(len(true_sentence.split()))
-
-        print(
-            f'{lm_results["session"][i]} - Block {lm_results["block"][i]}, Trial {lm_results["trial"][i]}'
-        )
-        print(f"True sentence:       {true_sentence}")
-        print(f"Predicted sentence:  {pred_sentence}")
-        print(
-            f"WER: {ed}/{len(true_sentence.split())} = {ed / len(true_sentence.split()):.2f}"
-        )
-        print()
-
-    print(
-        f"Aggregate Word Error Rate (WER): {100 * total_edit_distance / total_true_length:.2f}%"
-    )
+    if total_words > 0:
+        print(f"Aggregate WER: {100 * total_edits / total_words:.2f}%")
+    else:
+        print("No reference words found to compute WER.")
 else:
     print("[INFO] Test mode: skipping WER computation.")
 
-
-# ---------------------------------------------------------------
-# 輸出結果 CSV
-# ---------------------------------------------------------------
-output_file = os.path.join(
-    model_path,
-    f'baseline_rnn_{eval_type}_ctc_greedy_{time.strftime("%Y%m%d_%H%M%S")}.csv',
+# ---------------------------
+# Save results
+# ---------------------------
+out_csv = os.path.join(
+    args.model_path,
+    f"baseline_rnn_{args.eval_type}_kenlm_{time.strftime('%Y%m%d_%H%M%S')}.csv",
 )
-df_out = pd.DataFrame(
+pd.DataFrame(
     {"id": range(len(lm_results["pred_sentence"])), "text": lm_results["pred_sentence"]}
-)
-df_out.to_csv(output_file, index=False)
-print(f"[INFO] Saved results to {output_file}")
+).to_csv(out_csv, index=False)
+print(f"[INFO] Results saved to {out_csv}")

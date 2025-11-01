@@ -1,9 +1,9 @@
 model:
-  n_input_features: 512 # number of input features in the neural data. (2 features per electrode, 256 electrodes)
-  n_units: 768 # number of units per GRU layer
-  rnn_dropout: 0.4 # dropout rate for the GRU layers
+  n_input_features: 256 # number of input features in the neural data. (2 features per electrode, 256 electrodes)
+  n_units: 256 # number of units per GRU layer
+  rnn_dropout: 0.1 # dropout rate for the GRU layers
   rnn_trainable: true # whether the GRU layers are trainable
-  n_layers: 5 # number of GRU layers
+  n_layers: 3 # number of GRU layers
   patch_size: 14 # size of the input patches (14 time steps)
   patch_stride: 4 # stride for the input patches (4 time steps)
 
@@ -31,8 +31,8 @@ early_stopping_val_steps: 20 # number of validation steps to wait before stoppin
 
 num_training_batches: 120000 # number of training batches to run
 lr_scheduler_type: cosine # type of learning rate scheduler to use
-lr_max: 0.005 # maximum learning rate for the main model
-lr_min: 0.0001 # minimum learning rate for the main model
+lr_max: 0.0003 # maximum learning rate for the main model
+lr_min: 0.00003 # minimum learning rate for the main model
 lr_decay_steps: 120000 # number of steps for the learning rate decay
 lr_warmup_steps: 1000 # number of warmup steps for the learning rate scheduler
 lr_max_day: 0.005 # maximum learning rate for the day specific input layers
