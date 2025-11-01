@@ -3,7 +3,10 @@ import torch.nn.functional as F
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
 
-def gauss_smooth(inputs, device, smooth_kernel_std=2, smooth_kernel_size=100,  padding='same'):
+
+def gauss_smooth(
+    inputs, device, smooth_kernel_std=2, smooth_kernel_size=100, padding="same"
+):
     """
     Applies a 1D Gaussian smoothing operation with PyTorch to smooth the data along the time axis.
     Args:
@@ -31,7 +34,6 @@ def gauss_smooth(inputs, device, smooth_kernel_std=2, smooth_kernel_size=100,  p
     B, T, C = inputs.shape
     inputs = inputs.permute(0, 2, 1)  # [B, C, T]
     gaussKernel = gaussKernel.repeat(C, 1, 1)  # [C, 1, kernel_size]
-
     # Perform convolution
     smoothed = F.conv1d(inputs, gaussKernel, padding=padding, groups=C)
     return smoothed.permute(0, 2, 1)  # [B, T, C]
